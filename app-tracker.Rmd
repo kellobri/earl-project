@@ -1,0 +1,198 @@
+---
+title: "Shiny Load Tracker - Template Report"
+rmd_output_metadata:
+  rsc_email_suppress_scheduled: true
+output: 
+  flexdashboard::flex_dashboard:
+    theme: lumen
+    orientation: columns
+---
+
+```{r preflight_check, results='asis', include=TRUE}
+if (
+  nchar(Sys.getenv("CONNECT_SERVER")) == 0 ||
+  nchar(Sys.getenv("CONNECT_API_KEY")) == 0
+) {
+  print(htmltools::h4("ERROR: Variables Not Defined"))
+  print(htmltools::div(
+    "The CONNECT_SERVER and CONNECT_API_KEY",
+    "environment variables are required in order for this report",
+    "to pull usage data.",
+    htmltools::br(),
+    htmltools::br(),
+    "Please define these variables",
+    "and then re-run the report.",
+    htmltools::br(),
+    htmltools::br(),
+    style = "max-width: 600px"
+  ))
+  knitr::knit_exit("Terminating the report early.")
+}
+```
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(dplyr)
+library(ggplot2)
+library(shiny)
+library(lubridate)
+library(prettyunits)
+library(ggthemes)
+source("helpers.R")
+
+app_info <- get_content('046dfd8f-d6c4-4f4d-8097-77f608908a9d')
+
+shiny <- get_shiny_usage(content_guid = '046dfd8f-d6c4-4f4d-8097-77f608908a9d') %>% 
+  clean_data() %>%
+  mutate(day = round_date(started, "day")) %>%
+  filter(day > today() - ddays(2))
+data <- list(shiny = shiny)
+
+sf <- stamp("Sunday, Jan 17, 1999")
+```
+
+<div class = "row">
+<div class = "col-md-5">
+#### Application: [`r app_info$title`](`r app_info$url`)
+##### Last Published: `r sf(as_date(app_info$last_deployed_time))`
+<p>Description: `r app_info$description`</p> 
+<p>Access Type: `r app_info$access_type`</p>
+</div>
+
+<div class = "col-md-7">
+#### Template Directions: 
+* Provide an application `GUID`
+* Set a tracking window (days or hours)
+* Select a "Warning Buffer" based on your total connections allowed: `warn_buffer`
+* Set an average "Session Duration" goal - in minutes: `dur_goal`
+</div>
+</div>
+
+<hr>
+
+Column
+-----------------------------------------------------------------------
+
+### Recent Peak Session Load 
+
+```{r}
+intervals <- shiny %>%
+  mutate(session = interval(started, ended))
+totals <- c()
+for (i in 1:length(intervals$session)){
+  totals <- c(totals, (sum(sapply(intervals$session, function(x) int_overlaps(intervals$session[i,], x)))))
+}
+
+load_obs <- max(totals)
+max_conns <- app_info$max_processes * app_info$max_conns_per_process
+warn_buffer <- max_conns - 5
+
+if (load_obs >= warn_buffer) {
+    rmarkdown::output_metadata$set(rsc_email_suppress_scheduled = FALSE)
+}
+
+gauge(load_obs, min = 0, max = max_conns, gaugeSectors(
+  success = c(0, warn_buffer - 6), warning = c(warn_buffer - 5, warn_buffer - 1), danger = c(warn_buffer, max_conns)
+))
+```
+
+### Runtime Settings: R Processes Maximum
+
+```{r}
+valueBox(
+  value = app_info$max_processes,
+  icon = "fa-cogs",
+  color = "primary"
+)
+```
+
+### Runtime Settings: Connections per Process
+
+```{r}
+valueBox(
+  value = app_info$max_conns_per_process,
+  icon = "fa-mouse-pointer",
+  color = "primary"
+)
+```
+
+### Average Session Duration (minutes)
+
+```{r}
+dur_goal <- 5.5
+calc_avg <- mean(shiny$session_duration)/60
+avg_dur <- formatC(calc_avg, digits = 1, format = "f")
+valueBox(
+  value = avg_dur,
+  icon = "fa-stopwatch",
+  color = if (calc_avg >= dur_goal) "success" else "warning"
+)
+```
+
+
+Column {.tabset data-width=900}
+-------------------------------------
+
+### Shiny Sessions by Duration
+
+```{r shiny_over_hour}
+data$shiny %>%
+  mutate(username = join_users(user_guid), username = null_chars(username, "anonymous")) %>%
+  {ggplot(transform(., y=order(username, started)),
+       aes(x=started, xend=ended, y=y, yend=y, col=username)) +
+      ggthemes::theme_fivethirtyeight() +
+      xlab("Session Duration") + 
+  geom_segment(size=3) +
+  scale_y_discrete(breaks=NULL)}
+```
+
+### Shiny Sessions by User (Top 5)
+
+```{r shiny_by_user}
+data$shiny %>%
+    group_by(user_guid) %>% 
+    summarise(visits = n()) %>% 
+    mutate(username = join_users(user_guid),
+           username = null_chars(username, "anonymous")) %>% 
+    select(username, visits) %>% 
+    arrange(desc(visits)) %>% 
+    head(5) %>% 
+    {ggplot(., aes(reorder(username, visits), visits)) + 
+     geom_bar(stat = "identity") +  
+     coord_flip() + 
+     labs(
+       y = "Number of Shiny Sessions",
+       x = NULL
+     )}
+```
+
+```{r}
+library(blastula)
+# Link to published banner created in Google Drive
+img_link <- "https://docs.google.com/drawings/d/e/2PACX-1vRTgQpvT5VqeQeQsVysPyJnYSZbsLxtYV3etSn0NEk-PxD9_7sljl7JwXI2rar10BakQXkRbSAW-oGv/pub?w=477&h=143"
+message <- compose_email(
+    body = "
+  The runtime settings for: <strong>{app_info$title}</strong> may need to be adjusted.
+  
+  ![Cute Warning Image]({img_link})
+  
+  Observed Connections: <strong>{load_obs}</strong> Have recently exceeded the warning buffer of: <strong>{max_conns - warn_buffer}</strong>
+  
+  Current Runtime Settings:
+  
+  <ul>
+  <li>Max R Processes: {app_info$max_processes}</li> 
+  <li>Connections per Process: {app_info$max_conns_per_process}</li>
+  </ul>
+  
+  Access the application here: {app_info$url}
+  
+  <br />
+  Cheers, <br /> 
+  Shiny Application Monitoring-Bot"
+)
+# Set the R Markdown Output Metadata for email body and images
+rmarkdown::output_metadata$set(rsc_email_body_html = message$html_str)
+rmarkdown::output_metadata$set(rsc_email_subject = sprintf("Runtime Warning: %s", app_info$title))
+rmarkdown::output_metadata$set(rsc_email_images = message$images)
+```
